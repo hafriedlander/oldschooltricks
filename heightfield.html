@@ -1,0 +1,446 @@
+<!DOCTYPE html>
+<html lang="en">
+	<head>
+	<meta charset="utf-8" />
+
+	<!--
+Copyright (C) 2010, Hamish Friedlander <hamish@silverstripe.com>.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+    * Redistributions of source code must retain the above copyright
+      notice, this list of conditions and the following disclaimer.
+    * Redistributions in binary form must reproduce the above copyright
+      notice, this list of conditions and the following disclaimer in the
+      documentation and/or other materials provided with the distribution.
+    * Neither the name of the <organization> nor the
+      names of its contributors may be used to endorse or promote products
+      derived from this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL <COPYRIGHT HOLDER> BE LIABLE FOR ANY
+DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+(INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+	-->
+
+	<!--
+
+This is a Voxel based heightfield renderer, originally developed for a SilverStripe internal code competition
+
+Use the cursor keys to control the camera, a and s to move the sun's location, and hold d to enable the debug details
+
+The code is currently not very clean or readable, and it is hard coded to expect a heightfield of 513x513 resolution
+
+Todo:
+
+- Clean up - move js to seperate file, etc.
+
+- Remove 513x513 hard coding
+
+- Use canvases' resampled scaling to enlarge heightfield, so that normal map has greater resolution, and possibly allow us to remove the interpolation calculations
+
+- Use the other two channels of the heightfield to include static & dynamic locations of objects, with the eventual goal of turning this into the engine for a
+Commanche: Maximum Overkill style game
+
+- Probably the use of background: -webkit-canvas is unneeded
+
+- Further optimise inner loop
+
+Far future:
+
+- Use realworld heightmaps. Possibly integrate with google maps for color information.
+
+	-->
+
+	<title>Heightfield - a voxel based heightfield renderer</title>
+
+	<script src="jquery-142.js" type="text/javascript"></script>
+
+	<script type="text/javascript">
+
+		// Basic performance tweaking - number of voxel rows, and number of voxels in the closest row
+		// (more added in further rows, to reduce amount of x-data each voxel has to cover)
+		var nx=30, nz=60;
+
+		// Width of a voxel, and base height offset
+		var w=20, th=300;
+
+		// Angle of the sun
+		var sunangle = -35;
+
+		// Camera position and velocity
+		var position = {
+			x: 0,
+			y: 0,
+			a: 0
+		};
+
+		var velocity = {
+			y: 0,
+			a: 0
+		};
+
+		// We don't do one voxel row per z co-ordinate, because that means we get
+		// way too many rows in the distance. Precalculate the z co-ordinate
+		// for each voxel row
+		var zs = [];
+
+		// Same thing for x values, except that this is a 2d array [z][x]
+		var xs = [];
+		// And the calculate voxel data (again, 2d array, [z][x])
+		var vx = [];
+
+		// Given a selector, return the 2D canvas context
+		var getcontext = function(selector) {
+			var canvas = $(selector);
+			canvas.attr({width: 513, height: 513});
+			return canvas[0].getContext('2d');
+		}
+
+		// Normalise a [x,y,z] vector array
+		var normalise = function(v) {
+			var x = v[0], y = v[1], z = v[2];
+			var l = Math.sqrt(x*x+y*y+z*z);
+			return [x/l, y/l, z/l];
+		}
+
+		$(window).bind('load', function(){
+
+			var src = getcontext('canvas#src');
+
+			var draw = document.getCSSCanvasContext('2d', 'maincanvas', nx*w, th*2);
+
+			// Precalculate the voxel 2D and 3D locations
+			for (var z = 1; z < nz; z++) {
+				var zi = z*(1/nz);
+				var az = zs[z] = 1 + Math.pow(zi, 2) * 100;
+
+				xs[z] = [];
+				vx[z] = [];
+
+				var rowx = Math.floor(nx * az);
+				var roww = w*nx/rowx;
+
+				if (roww < 8) {
+					roww = 8;
+					rowx = Math.round(w*nx/8);
+				}
+
+				var roww = w*nx/rowx;
+
+				for (var x = 0; x < rowx; x++) {
+
+					var left = Math.floor(x*roww);
+					var width = Math.floor((x+1)*roww) - left;
+
+					vx[z][x] = [width, left];
+					xs[z][x] = ((left + width/2) - (w*nx)/2) * az / 250;
+				}
+			}
+
+			// Calculate the extents, so we can pull the needed square as data out of the image
+			var maxz = Math.ceil(zs[nz-1]);
+			var minx = Math.floor(xs[nz-1][0]);
+			var maxx = Math.ceil(xs[nz-1][xs[nz-1].length-1]);
+
+			var xwidth = maxx - minx+1;
+
+			// Pre-calculate normals
+			var normsrc = getcontext('canvas#normsrc');
+			var normtrans = getcontext('canvas#normtrans');
+
+			src.drawImage($('#heightfield')[0], 0, 0);
+			var srcData = src.getImageData(0, 0, 513, 513);
+
+			for (var y = 0; y < 513; y++ ) {
+				var ptr = y*srcData.width*4;
+
+				for (var x = 0 ; x < 513; x++, ptr+=4) {
+					var xy = srcData.data[ptr] ;
+					var Xy = srcData.data[ptr+4];
+					var xY = srcData.data[ptr+srcData.width*4];
+
+					var va = normalise([1, xy - Xy, 0]);
+					var vb = normalise([0, xy - xY, 1]);
+
+					// var vn = normalise([va[1], -1, vb[1]]); // <- the result of merging the 0 and 1's from above into a crossproduct equatiion
+					var vn = normalise([va[1], 1, vb[1]]); // <- the result of merging the 0 and 1's from above into a crossproduct equatiion
+
+					srcData.data[ptr]   = 128 + Math.round(vn[0] * 127);
+					srcData.data[ptr+1] = 128 + Math.round(vn[1] * 127);
+					srcData.data[ptr+2] = 128 + Math.round(vn[2] * 127);
+				}
+			}
+
+			normsrc.putImageData(srcData, 0, 0, 0, 0, srcData.width, srcData.height);
+
+			// A timestep
+			var step = function(){
+
+				// Handle a timestep's worth of camera motion
+				if (ud == 1) {
+					velocity.y = Math.min(2, velocity.y + 0.25);
+				}
+				else if (ud == -1) {
+					velocity.y = Math.max(-2, velocity.y - 0.25);
+				}
+				else {
+					if (velocity.y < 0) velocity.y += 0.25;
+					else if (velocity.y > 0) velocity.y -= 0.25;
+				}
+
+				if (lr == -1) {
+					velocity.a = Math.min(0.04, velocity.a + 0.004);
+				}
+				else if (lr == 1) {
+					velocity.a = Math.max(-0.04, velocity.a - 0.004);
+				}
+				else {
+					if (velocity.a < 0) velocity.a += 0.004;
+					else if (velocity.a > 0) velocity.a -= 0.004;
+				}
+
+				if (velocity.y) {
+					var v = [];
+					v[0] = -velocity.y * Math.sin(position.a*Math.PI);
+					v[1] = +velocity.y * Math.cos(position.a*Math.PI);
+
+					position.x += v[0];
+					position.y += v[1];
+				}
+
+				if (velocity.a) {
+					position.a += velocity.a;
+				}
+
+				// Do the rendering
+
+				$('#hills').css({'-webkit-transform': 'rotate('+(velocity.a*200)+'deg)'});
+
+				var transform = function(src, dst) {
+					dst.clearRect(0, 0, 513,513);
+					dst.save();
+
+					dst.translate(256,256);
+					dst.rotate(position.a*Math.PI);
+					dst.translate(-position.x,position.y);
+					dst.translate(-256,-256);
+
+					dst.drawImage(src, 0, 0);
+					dst.restore();
+
+				}
+
+				// Apply the camera transform to the hill data, then extract values
+				transform($('#heightfield')[0], src);
+				var data = src.getImageData(256+minx, 256-maxz, xwidth, maxz);
+				var dataRowOffset= data.width * 4; data = data.data;
+
+				// And the same for the normal data
+				transform($('canvas#normsrc')[0], normtrans);
+				var normData = normtrans.getImageData(256+minx, 256-maxz, xwidth, maxz);
+				var normDataRowOffset = normData.width * 4; normData = normData.data;
+
+				draw.clearRect(0, 0, nx*w, th*2);
+
+				// Find average height of closest row, to adjust view point to never be underground
+				var avh = 0;
+
+				var xcount = xs[1].length;
+				var az = zs[1];
+				var ptr = (maxz-Math.floor(az))*dataRowOffset;
+
+				for (var x = 0; x < xcount; x++) {
+					var ax = xs[1][x];
+					avh += data[ptr + (Math.floor(ax)-minx)*4];
+				}
+
+				avh /= xcount;
+
+				// Render the voxels
+
+				for (var z = nz-1; z > 0; z--) {
+					var xcount = xs[z].length;
+
+					var az = zs[z];
+					var voxz = maxz-Math.floor(az); ptrbase = voxz*dataRowOffset;
+
+					var oh = th + (velocity.y * 30);
+					var pxbase = oh - (oh+avh*10)/az;
+
+					for (var x = 0; x < xcount; x++) {
+
+						var ax = xs[z][x];
+						var voxx = Math.floor(ax)-minx, ptr = ptrbase+voxx*4;
+
+						// Interpolate height
+						var xy = data[ptr];
+						var Xy = data[ptr+4];
+
+						var xY = data[ptr-dataRowOffset];
+						var XY = data[ptr-dataRowOffset+4];
+
+						var xo = ax - Math.floor(ax);
+						var my = xy * (1-xo) + Xy * xo;
+						var mY = xY * (1-xo) + XY * xo;
+
+						var yo = az - Math.floor(az);
+						var height = my * (1-yo) + mY * yo;
+
+						// Grab normal
+						var nm = [(normData[ptr]-128)/127, (normData[ptr+1]-128)/127, (normData[ptr+2]-128)/127];
+						if (height < 30) { height = 30; nm = [0,1,0]; }
+
+						// Calculate light vector
+						//var vlx = 0.57735, vly = 0.57735, vlz = 0.57735;
+						var vlx = 1*Math.cos(sunangle/180*Math.PI), vly = -1*Math.sin(sunangle/180*Math.PI), vlz = 0;
+
+						// Find phong shading difuse co-efficient
+						var ldp = vlx*nm[0]+vly*nm[1]+vlz*nm[2]; ldp *= 0.6;
+
+						// Find color from height & apply shading
+						var col =
+							height == 30 ? [32, 32, 200] :
+							height < 100 ? [32, 256, 48] :
+							height < 150 ? [128, 128, 128] :
+							[255, 255, 255];
+
+						col[0] = Math.max(0, Math.min(255, Math.floor(col[0] * 0.4 + col[0] * ldp)));
+						col[1] = Math.max(0, Math.min(255, Math.floor(col[1] * 0.4 + col[1] * ldp)));
+						col[2] = Math.max(0, Math.min(255, Math.floor(col[2] * 0.4 + col[2] * ldp)));
+
+						var pxheight = pxbase + height*8 / az;
+
+						if (pxheight > 0) {
+							draw.fillStyle = 'rgb('+col.join(',')+')';
+							draw.fillRect(vx[z][x][1], th*2-pxheight, vx[z][x][0], pxheight);
+						}
+
+					}
+
+				}
+
+				setTimeout(step, 0);
+			}
+
+			// Control handling
+
+			var ud = 0;
+			var lr = 0;
+
+			$(document).bind('keydown', function(e){
+				switch (e.keyCode) {
+					case 38: // up
+						ud = 1;
+						break;
+					case 39: // right
+						lr = 1;
+						break;
+					case 40: // down
+						ud = -1;
+						break;
+					case 37: // left
+						lr = -1;
+						break
+					case 68: // d
+						$(document.body).addClass('debug');
+						break;
+					case 65: // a
+						sunangle -= 5;
+						break;
+					case 83: //s
+						sunangle += 5;
+						break;
+				}
+			});
+
+			$(document).bind('keyup', function(e){
+				if ((e.keyCode == 38 && ud == 1) || (e.keyCode == 40 && ud == -1)) {
+					ud = 0;
+				}
+				else if ((e.keyCode == 39 && lr == 1) || (e.keyCode == 37 && lr == -1)) {
+					lr = 0;
+				}
+				else if (e.keyCode == 68) {
+					$(document.body).removeClass('debug');
+				}
+			});
+
+			step();
+
+		})
+
+	</script>
+
+	<style type="text/css">
+
+		html, body {
+			overflow: hidden;
+			height: 100%; width: 100%;
+			margin: 0; padding: 0;
+		}
+
+		body {
+			background: -webkit-gradient(
+				 linear,
+				 left top,
+				 left bottom,
+				 color-stop(0, rgb(64,64,256)),
+				 color-stop(1, rgb(256,256,256))
+			);
+		}
+
+		#hills {
+			position: absolute;
+			left: -7%;
+			right: -7%;
+			top: 0;
+			bottom: -7%;
+			background: -webkit-canvas(maincanvas);
+			-webkit-background-size: 100% auto;
+			background-repeat: no-repeat;
+			background-position: left bottom;
+		}
+
+		canvas, img {	
+			position: absolute;
+			top: -500px;
+			visibility: hidden;
+		}
+
+		#src, #normtrans {
+			top: 0;
+			left: 0;
+			z-index: 2;
+		}
+
+		#normtrans {
+			left: 540px;
+		}
+
+		body.debug #src, body.debug #normtrans {
+			visibility: visible;
+		}
+
+	</style>
+
+</head>
+
+<body>
+	<img src="heightfield.jpg" id='heightfield' />
+	<canvas id="src"></canvas>
+	
+	<canvas id="normsrc"></canvas>
+	<canvas id="normtrans"></canvas>
+
+	<div id="hills"></div>
+</body>
+
+</html>
