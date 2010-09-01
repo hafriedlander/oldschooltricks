@@ -42,10 +42,6 @@ Todo:
 
 - Clean up - move js to seperate file, etc.
 
-- Remove 513x513 hard coding
-
-- Use canvases' resampled scaling to enlarge heightfield, so that normal map has greater resolution, and possibly allow us to remove the interpolation calculations
-
 - Use the other two channels of the heightfield to include static & dynamic locations of objects, with the eventual goal of turning this into the engine for a
 Commanche: Maximum Overkill style game
 
@@ -65,12 +61,17 @@ Far future:
 
 	<script type="text/javascript">
 
+		var debug = false;
+
 		// Basic performance tweaking - number of voxel rows, and number of voxels in the closest row
 		// (more added in further rows, to reduce amount of x-data each voxel has to cover)
-		var nx=30, nz=60;
+		var nx=60, nz=40;//66;
 
 		// Width of a voxel, and base height offset
-		var w=20, th=300;
+		var w=10, th=350, dth = th*2;
+
+		// Width of the scaled height map (not the input map)
+		var heightfield_scale = 2, heightfield_width, heightfield_height;
 
 		// Angle of the sun
 		var sunangle = -35;
@@ -98,9 +99,9 @@ Far future:
 		var vx = [];
 
 		// Given a selector, return the 2D canvas context
-		var getcontext = function(selector) {
+		var getcontext = function(selector, width, height) {
 			var canvas = $(selector);
-			canvas.attr({width: 513, height: 513});
+			canvas.attr({width: width || heightmap_width, height: height || heightmap_height});
 			return canvas[0].getContext('2d');
 		}
 
@@ -113,14 +114,10 @@ Far future:
 
 		$(window).bind('load', function(){
 
-			var src = getcontext('canvas#src');
-
-			var draw = document.getCSSCanvasContext('2d', 'maincanvas', nx*w, th*2);
-
 			// Precalculate the voxel 2D and 3D locations
 			for (var z = 1; z < nz; z++) {
 				var zi = z*(1/nz);
-				var az = zs[z] = 1 + Math.pow(zi, 2) * 100;
+				var az = zs[z] = 1 + Math.pow(zi, 2) * (60*heightfield_scale);
 
 				xs[z] = [];
 				vx[z] = [];
@@ -128,9 +125,9 @@ Far future:
 				var rowx = Math.floor(nx * az);
 				var roww = w*nx/rowx;
 
-				if (roww < 8) {
-					roww = 8;
-					rowx = Math.round(w*nx/8);
+				if (roww < 4) {
+					roww = 4;
+					rowx = Math.round(w*nx/4);
 				}
 
 				var roww = w*nx/rowx;
@@ -152,17 +149,26 @@ Far future:
 
 			var xwidth = maxx - minx+1;
 
+			var heightmap_dim = Math.max(xwidth, maxz*2); heightmap_dim = Math.ceil(Math.sqrt(heightmap_dim*heightmap_dim*2));
+
+			// Prep the heightfield
+			var draw = document.getCSSCanvasContext('2d', 'maincanvas', nx*w, th*2);
+
+			heightfield_width =  $('#heightfield')[0].width; heightfield_height = $('#heightfield')[0].height;
+
+			var src = getcontext('canvas#src', heightfield_width, heightfield_height);
+
 			// Pre-calculate normals
-			var normsrc = getcontext('canvas#normsrc');
-			var normtrans = getcontext('canvas#normtrans');
+			var normsrc = getcontext('canvas#normsrc', heightfield_width, heightfield_height);
+			var normtrans = getcontext('canvas#normtrans', heightmap_dim, heightmap_dim);
 
 			src.drawImage($('#heightfield')[0], 0, 0);
-			var srcData = src.getImageData(0, 0, 513, 513);
+			var srcData = src.getImageData(0, 0, heightfield_width, heightfield_height);
 
-			for (var y = 0; y < 513; y++ ) {
+			for (var y = 0; y < srcData.height; y++ ) {
 				var ptr = y*srcData.width*4;
 
-				for (var x = 0 ; x < 513; x++, ptr+=4) {
+				for (var x = 0 ; x < srcData.width; x++, ptr+=4) {
 					var xy = srcData.data[ptr] ;
 					var Xy = srcData.data[ptr+4];
 					var xY = srcData.data[ptr+srcData.width*4];
@@ -173,16 +179,59 @@ Far future:
 					// var vn = normalise([va[1], -1, vb[1]]); // <- the result of merging the 0 and 1's from above into a crossproduct equatiion
 					var vn = normalise([va[1], 1, vb[1]]); // <- the result of merging the 0 and 1's from above into a crossproduct equatiion
 
-					srcData.data[ptr]   = 128 + Math.round(vn[0] * 127);
-					srcData.data[ptr+1] = 128 + Math.round(vn[1] * 127);
-					srcData.data[ptr+2] = 128 + Math.round(vn[2] * 127);
+					srcData.data[ptr]   = 32 + Math.round(vn[0] * 32);
+					srcData.data[ptr+1] = 32 + Math.round(vn[1] * 32);
+					srcData.data[ptr+2] = 32 + Math.round(vn[2] * 32);
 				}
 			}
 
-			normsrc.putImageData(srcData, 0, 0, 0, 0, srcData.width, srcData.height);
+			normsrc.putImageData(srcData, 0, 0, 0, 0, heightfield_width, heightfield_height);
+
+			var src = getcontext('canvas#src', heightmap_dim, heightmap_dim);
+
+			var lighting, lighting_sunangle = null;
+
+			var recalc_lighting = function() {
+				// Calculate light vector
+				var vlx = 1*Math.cos(sunangle/180*Math.PI), vly = -1*Math.sin(sunangle/180*Math.PI), vlz = 0;
+
+				lighting = []; lighting_sunangle = sunangle;
+
+				for (var x = 0; x <= 65; x++) {
+					lighting[x] = [];
+					for (var y = 0; y <= 65; y++) {
+						lighting[x][y] = [];
+						for (var z = 0; z <= 65; z++) {
+							lighting[x][y][z] = [];
+							
+							// Get the surface normal
+							var nmx = (x-32)/32, nmy = (y-32)/32, nmz = (z-32)/32;
+
+							// Find phong shading diffuse co-efficient
+							var ldp = vlx*nmx+vly*nmy+vlz*nmz; ldp *= 0.6;
+
+							$.each([[32, 32, 200], [32, 256, 48], [128, 128, 128], [255, 255, 255]], function(i, col) {
+
+								var hldp = (i == 0) ? vly*0.6 /* (0,1,0) */ : ldp;
+
+								col[0] = Math.max(0, Math.min(255, Math.floor(col[0] * 0.4 + col[0] * hldp)));
+								col[1] = Math.max(0, Math.min(255, Math.floor(col[1] * 0.4 + col[1] * hldp)));
+								col[2] = Math.max(0, Math.min(255, Math.floor(col[2] * 0.4 + col[2] * hldp)));
+
+								lighting[x][y][z][i] = 'rgb('+col.join(',')+')';
+							});
+						}
+					}
+				}
+			}
+
+			var running = false;
+
 
 			// A timestep
 			var step = function(){
+
+				if (lighting_sunangle === null || lighting_sunangle != sunangle) recalc_lighting();
 
 				// Handle a timestep's worth of camera motion
 				if (ud == 1) {
@@ -208,12 +257,8 @@ Far future:
 				}
 
 				if (velocity.y) {
-					var v = [];
-					v[0] = -velocity.y * Math.sin(position.a*Math.PI);
-					v[1] = +velocity.y * Math.cos(position.a*Math.PI);
-
-					position.x += v[0];
-					position.y += v[1];
+					position.x -= velocity.y * Math.sin(position.a*Math.PI);
+					position.y += velocity.y * Math.cos(position.a*Math.PI);
 				}
 
 				if (velocity.a) {
@@ -225,27 +270,51 @@ Far future:
 				$('#hills').css({'-webkit-transform': 'rotate('+(velocity.a*200)+'deg)'});
 
 				var transform = function(src, dst) {
-					dst.clearRect(0, 0, 513,513);
+					dst.fillStyle = "#000"; // Good for both normal map and heightfield
+					dst.fillRect(0, 0, heightmap_dim, heightmap_dim);
 					dst.save();
 
-					dst.translate(256,256);
+					dst.translate(heightmap_dim/2,heightmap_dim/2);
 					dst.rotate(position.a*Math.PI);
-					dst.translate(-position.x,position.y);
-					dst.translate(-256,-256);
+					dst.translate(-heightmap_dim/2,-heightmap_dim/2);
 
-					dst.drawImage(src, 0, 0);
+					var srcx = heightfield_width/2+position.x, srcy = heightfield_height/2-position.y;
+					var srcw = heightmap_dim/heightfield_scale, srch = heightmap_dim/heightfield_scale;
+					var dstx = 0, dsty = 0, dstw = heightmap_dim, dsth = heightmap_dim;
+
+					/* Canvas barfs if you try and use dimensions that extend beyond actual data, so we have to manually clip */
+					if (srcx + srcw > heightfield_width) {
+						if (srcx > heightfield_width) return;
+						srcw = heightfield_width - srcx; dstw = srcw * heightfield_scale;
+					}
+					else if (srcx < 0) {
+						srcw += srcx; if (srcw <= 0) return;
+						dstw = srcw * heightfield_scale;	dstx = -(srcx*heightfield_scale); srcx = 0;
+					}
+
+					if (srcy + srch > heightfield_height) {
+						if (srcy > heightfield_height) return;
+						srch = heightfield_height - srcy; dsth = srch * heightfield_scale;
+					}
+					else if (srcy < 0) {
+						srch += srcy; if (srch <= 0) return;
+						dsth = srch * heightfield_scale; dsty = -(srcy*heightfield_scale); srcy = 0;
+					}
+
+					dst.drawImage(src, srcx, srcy, srcw, srch, dstx, dsty, dstw, dsth);
 					dst.restore();
 
 				}
 
 				// Apply the camera transform to the hill data, then extract values
 				transform($('#heightfield')[0], src);
-				var data = src.getImageData(256+minx, 256-maxz, xwidth, maxz);
+				var data = src.getImageData(heightmap_dim/2+minx, heightmap_dim/2-maxz, xwidth, maxz);
+				var tmpdata = data;
 				var dataRowOffset= data.width * 4; data = data.data;
 
 				// And the same for the normal data
 				transform($('canvas#normsrc')[0], normtrans);
-				var normData = normtrans.getImageData(256+minx, 256-maxz, xwidth, maxz);
+				var normData = normtrans.getImageData(heightmap_dim/2+minx, heightmap_dim/2-maxz, xwidth, maxz);
 				var normDataRowOffset = normData.width * 4; normData = normData.data;
 
 				draw.clearRect(0, 0, nx*w, th*2);
@@ -273,61 +342,50 @@ Far future:
 					var voxz = maxz-Math.floor(az); ptrbase = voxz*dataRowOffset;
 
 					var oh = th + (velocity.y * 30);
-					var pxbase = oh - (oh+avh*10)/az;
+					var pxbase = oh - (oh+avh*15*heightfield_scale)/az;
+
+					var row_xs = xs[z], row_vx = vx[z];
 
 					for (var x = 0; x < xcount; x++) {
 
-						var ax = xs[z][x];
+						var ax = row_xs[x];
 						var voxx = Math.floor(ax)-minx, ptr = ptrbase+voxx*4;
 
-						// Interpolate height
-						var xy = data[ptr];
-						var Xy = data[ptr+4];
+						// Get height
+						var height = data[ptr];
+						var pxheight = pxbase + height*12*heightfield_scale / az;
 
-						var xY = data[ptr-dataRowOffset];
-						var XY = data[ptr-dataRowOffset+4];
+						// And normal
+						var nmx = normData[ptr], nmy = normData[ptr+1], nmz = normData[ptr+2];
 
-						var xo = ax - Math.floor(ax);
-						var my = xy * (1-xo) + Xy * xo;
-						var mY = xY * (1-xo) + XY * xo;
-
-						var yo = az - Math.floor(az);
-						var height = my * (1-yo) + mY * yo;
-
-						// Grab normal
-						var nm = [(normData[ptr]-128)/127, (normData[ptr+1]-128)/127, (normData[ptr+2]-128)/127];
-						if (height < 30) { height = 30; nm = [0,1,0]; }
-
-						// Calculate light vector
-						//var vlx = 0.57735, vly = 0.57735, vlz = 0.57735;
-						var vlx = 1*Math.cos(sunangle/180*Math.PI), vly = -1*Math.sin(sunangle/180*Math.PI), vlz = 0;
-
-						// Find phong shading difuse co-efficient
-						var ldp = vlx*nm[0]+vly*nm[1]+vlz*nm[2]; ldp *= 0.6;
+						// Set the water height
+						if (height <= 30) height = 30;
 
 						// Find color from height & apply shading
-						var col =
-							height == 30 ? [32, 32, 200] :
-							height < 100 ? [32, 256, 48] :
-							height < 150 ? [128, 128, 128] :
-							[255, 255, 255];
-
-						col[0] = Math.max(0, Math.min(255, Math.floor(col[0] * 0.4 + col[0] * ldp)));
-						col[1] = Math.max(0, Math.min(255, Math.floor(col[1] * 0.4 + col[1] * ldp)));
-						col[2] = Math.max(0, Math.min(255, Math.floor(col[2] * 0.4 + col[2] * ldp)));
-
-						var pxheight = pxbase + height*8 / az;
+						var ci =
+							height == 30 ? 0 :
+							height < 100 ? 1 :
+							height < 150 ? 2 :
+							3;
 
 						if (pxheight > 0) {
-							draw.fillStyle = 'rgb('+col.join(',')+')';
-							draw.fillRect(vx[z][x][1], th*2-pxheight, vx[z][x][0], pxheight);
+							draw.fillStyle = lighting[nmx][nmy][nmz][ci];
+
+							if (z > nz-4) draw.globalAlpha = ((nz-1)-z)/4;
+							else draw.globalAlpha = 1;
+							
+							draw.fillRect(row_vx[x][1], dth-pxheight, row_vx[x][0], pxheight);
 						}
 
+						if (debug) data[ptr+1] = 255;
 					}
 
 				}
 
-				setTimeout(step, 0);
+				if (debug) src.putImageData(tmpdata, heightmap_dim/2+minx, heightmap_dim/2-maxz, 0, 0, tmpdata.width, tmpdata.height);
+
+				if (velocity.y || velocity.a) { running = true; setTimeout(step, 0); }
+				else running = false;
 			}
 
 			// Control handling
@@ -350,7 +408,7 @@ Far future:
 						lr = -1;
 						break
 					case 68: // d
-						$(document.body).addClass('debug');
+						$(document.body).addClass('debug'); debug = true;
 						break;
 					case 65: // a
 						sunangle -= 5;
@@ -359,6 +417,8 @@ Far future:
 						sunangle += 5;
 						break;
 				}
+
+				if (!running) step();
 			});
 
 			$(document).bind('keyup', function(e){
@@ -369,8 +429,10 @@ Far future:
 					lr = 0;
 				}
 				else if (e.keyCode == 68) {
-					$(document.body).removeClass('debug');
+					$(document.body).removeClass('debug'); debug = false;
 				}
+
+				if (!running) step();
 			});
 
 			step();
@@ -415,14 +477,18 @@ Far future:
 			visibility: hidden;
 		}
 
-		#src, #normtrans {
+		#src, #normsrc, #normtrans {
 			top: 0;
 			left: 0;
 			z-index: 2;
 		}
 
+		#normsrc {
+			left: 200px;
+		}
+
 		#normtrans {
-			left: 540px;
+			left: 400px;
 		}
 
 		body.debug #src, body.debug #normtrans {
